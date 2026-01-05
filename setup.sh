@@ -16,6 +16,17 @@ set -e
 IMS_HOST=${IMS_HOST:-"ims-na1.adobelogin.com"}
 PLATFORM_GATEWAY=${PLATFORM_GATEWAY:-"https://platform.adobe.io/"}
 
+SANDBOX_NAME=${SANDBOX_NAME:-""}
+if [ -z "${SANDBOX_NAME}" ]; then
+  echo "Enter Sandbox Name (default: prod)"
+  read input
+  if [ -z "${input}" ]; then
+    SANDBOX_NAME="prod"
+  else
+    SANDBOX_NAME="${input}"
+  fi
+fi
+
 IMS_ORG=${IMS_ORG:-""}
 if [ -z "${IMS_ORG}" ]; then
   echo "Enter IMS ORG"
@@ -34,27 +45,25 @@ if [ -z "${CLIENT_SECRET}" ]; then
   read CLIENT_SECRET
 fi
 
-JWT_TOKEN=${JWT_TOKEN}
-if [ -z "${JWT_TOKEN}" ]; then
-  echo "Enter JWT Token"
-  read JWT_TOKEN
+# Fetch Access token using OAuth Server-to-Server
+echo "Fetching access token..."
+ims_response=$(curl -X POST \
+  https://${IMS_HOST}/ims/token/v3 \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=client_credentials" \
+  -d "client_id=${CLIENT_ID}" \
+  -d "client_secret=${CLIENT_SECRET}" \
+  -d "scope=openid,AdobeID,read_organizations,additional_info.projectedProductContext,additional_info.roles" 2>/dev/null)
+
+access_token=$(echo "${ims_response}" | jq -r ".access_token")
+
+if [[ "${access_token}" == "null" ]] || [[ -z "${access_token}" ]]; then
+  echo "Error: Unable to fetch access token from IMS"
+  echo "Response: ${ims_response}"
+  exit 1
 fi
 
-# Fetch Access token
-ims_response=$(curl -i -o - --silent -X POST \
-  https://${IMS_HOST}/ims/exchange/jwt/ \
-  -H "Content-Type: multipart/form-data" \
-  -F client_id=${CLIENT_ID} \
-  -F client_secret=${CLIENT_SECRET} \
-  -F jwt_token=${JWT_TOKEN} 2>/dev/null)
-
-ims_response_code=$(echo "$ims_response" | grep -v '100 Continue' | grep HTTP |  awk '{print $2}')
-if [[ "${ims_response_code}" -ge "400" ]]; then
-  echo "Error: Unable to fetch access token from IMS, response code: ${ims_response_code}";
-  exit 1;
-fi
-
-access_token=$(echo "${ims_response}" | grep 'access_token' | jq -r ".access_token");
+echo "Access token obtained successfully"
 
 dateString=`date +%Y%m%d%H%M%S`
 
@@ -73,6 +82,7 @@ schema_response=$(curl -i -o - --silent -X POST \
   -H "Content-Type: application/json" \
   -H "x-api-key: ${CLIENT_ID}" \
   -H "x-gw-ims-org-id: ${IMS_ORG}" \
+  -H "x-sandbox-name: ${SANDBOX_NAME}" \
   -d '{
     "type": "object",
     "title": "'"${SCHEMA_NAME}"'",
@@ -104,8 +114,9 @@ schema_response=$(curl -i -o - --silent -X POST \
 
 schema_response_code=$(echo "$schema_response" | grep -v '100 Continue' | grep HTTP |  awk '{print $2}')
 if [[ "${schema_response_code}" -ge "400" ]]; then
-  echo "Error: Unable to create schema, response code: ${schema_response_code}";
-  exit 1;
+  echo "Error: Unable to create schema, response code: ${schema_response_code}"
+  echo "Response Body: ${schema_response}"
+  exit 1
 fi
 
 schema=$(echo "${schema_response}" | grep 'meta:resourceType' | jq -r '.["$id"]')
@@ -127,6 +138,7 @@ dataSet=$(curl -X POST \
   -H "Content-Type: application/json" \
   -H "x-api-key: ${CLIENT_ID}" \
   -H "x-gw-ims-org-id: ${IMS_ORG}" \
+  -H "x-sandbox-name: ${SANDBOX_NAME}" \
   -d '{
     "name": "'"${DATASET_NAME}"'",
     "description": "Test for ingesting streaming data into profile",
@@ -172,6 +184,7 @@ connection_response=$(curl -X POST \
   -H "Content-Type: application/json" \
   -H "x-api-key: ${CLIENT_ID}" \
   -H "x-gw-ims-org-id: ${IMS_ORG}" \
+  -H "x-sandbox-name: ${SANDBOX_NAME}" \
   -d '
    {
     "name": "'"${INLET_NAME}"'",
@@ -191,12 +204,13 @@ connection_response=$(curl -X POST \
     }
    }' 2> /dev/null)
 
-connection_response_code=$(echo "${connection_response}" | grep -v '100 Continue' | grep HTTP  |  awk '{print $2}')
-if [[ "${connection_response_code}" -ge "400" ]]; then
-  echo "Error: Unable to create streaming connection, response code: ${connection_response_code}";
-  exit 1;
+streamingConnectionId=$(echo "${connection_response}" | jq -r ".id")
+
+if [[ "${streamingConnectionId}" == "null" ]] || [[ -z "${streamingConnectionId}" ]]; then
+  echo "Error: Unable to create streaming connection"
+  echo "Response: ${connection_response}"
+  exit 1
 fi
-streamingConnectionId=$(echo "${connection_response}" | grep 'id' | jq -r ".id")
 
 echo "Streaming Connection: ${streamingConnectionId}"
 
@@ -205,17 +219,19 @@ inlet_response=$(curl -i -o - --silent \
   -H "Authorization: Bearer ${access_token}" \
   -H "Content-Type: application/json" \
   -H "x-api-key: ${CLIENT_ID}" \
-  -H "x-gw-ims-org-id: ${IMS_ORG}"
+  -H "x-gw-ims-org-id: ${IMS_ORG}" \
+  -H "x-sandbox-name: ${SANDBOX_NAME}" \
   2> /dev/null)
 
 inlet_response_code=$(echo "$inlet_response" | grep -v '100 Continue' | grep HTTP  |  awk '{print $2}')
 if [[ "${inlet_response_code}" -ge "400" ]]; then
-  echo "Error: Unable to fetch connection info, response code: ${inlet_response_code}";
-  exit 1;
+  echo "Error: Unable to fetch connection info, response code: ${inlet_response_code}"
+  exit 1
 fi
+
 streamingEndpoint=$(echo "${inlet_response}" | grep "inletUrl" | jq -r ".items[0].auth.params.inletUrl")
 
-echo "Streaming Connection: "${streamingEndpoint}
+echo "Streaming Endpoint: ${streamingEndpoint}"
 
 # Create a Connect Instance
 connectTopicName="connect-test-${dateString}"
@@ -242,8 +258,8 @@ aem_connector_response=$(curl -i -o - --silent -X POST \
 
 aem_connector_response_code=$(echo "$aem_connector_response" | grep -v '100 Continue'| grep HTTP |  awk '{print $2}')
 if [[ "${aem_connector_response_code}" -ge "400" ]]; then
-  echo "Error: Unable to create streaming connector, response code: ${aem_connector_response_code}";
-  exit 1;
+  echo "Error: Unable to create streaming connector, response code: ${aem_connector_response_code}"
+  exit 1
 fi
 
 echo "AEP Sink Connector ${aemSinkConnectorName}"
